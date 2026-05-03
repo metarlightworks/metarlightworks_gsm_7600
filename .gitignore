@@ -1,0 +1,12 @@
+build/
+*.elf
+*.map
+*.hex
+*.bin
+*.partitions.bin
+*.bootloader.bin
+.DS_Store
+.env
+secrets.h
+private_config.h
+avwx_key.txt

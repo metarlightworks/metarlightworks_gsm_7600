@@ -1,0 +1,8 @@
+{
+  "version": "1.0.15",
+  "build": "SIM7600G",
+  "board": "LILYGO_SIM7600X",
+  "asset": "METARLightworks_GSM_7600.bin",
+  "url": "https://github.com/metarlightworks/metarlightworks_gsm_7600/releases/download/v1.0.15/METARLightworks_GSM_7600.bin",
+  "notes": "Initial SIM7600G OTA repo migration build. OTA is Wi-Fi only. AVWX key is expected from NVS."
+}
