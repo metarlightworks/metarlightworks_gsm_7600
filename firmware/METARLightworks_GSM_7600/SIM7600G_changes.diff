@@ -1,0 +1,353 @@
+--- /mnt/data/METARLightworks_GSM.ino	2026-05-03 10:45:54.315575470 +0000
++++ /mnt/data/METARLightworks_GSM_SIM7600G.ino	2026-05-03 10:48:36.799760606 +0000
+@@ -17,21 +17,33 @@
+ // - Flight Pulse is WiFi-only
+ // ============================================================
+ 
+-#define LILYGO_T_CALL_A7670_V1_0
++// LilyGO T-SIM7600G-H / T-SIM7600X ESP32 target
++// Board/Product: https://lilygo.cc/products/t-sim7600
++#define LILYGO_SIM7600X
++#define TINY_GSM_RX_BUFFER 1024
+ 
+ #include "utilities.h"
+ 
++#ifndef MODEM_POWERON_PULSE_WIDTH_MS
++#define MODEM_POWERON_PULSE_WIDTH_MS 1000
++#endif
++
++// SIM7600 does not use the A76XX secure-client wrapper.
++// LilyGO's current SIM7600 examples use the modem built-in HTTPS API.
++#if defined(TINY_GSM_MODEM_SIM7600)
++#define MLW_CELLULAR_BUILTIN_HTTPS 1
++#else
++#define MLW_CELLULAR_BUILTIN_HTTPS 0
+ #ifdef TINY_GSM_MODEM_A7670
+ #undef TINY_GSM_MODEM_A7670
+ #endif
+-
+ #ifdef TINY_GSM_MODEM_A7608
+ #undef TINY_GSM_MODEM_A7608
+ #endif
+-
+ #ifndef TINY_GSM_MODEM_A76XXSSL
+ #define TINY_GSM_MODEM_A76XXSSL
+ #endif
++#endif
+ 
+ #define TINY_GSM_DEBUG Serial
+ 
+@@ -49,11 +61,15 @@
+ #include <math.h>
+ #include "TimeSync.h"
+ 
++#if MLW_CELLULAR_BUILTIN_HTTPS && !defined(TINY_GSM_FORK_LIBRARY)
++#error "SIM7600G build requires the LilyGO TinyGSM fork from Xinyuan-LilyGO/LilyGo-Modem-Series/lib. Mainline TinyGSM does not provide the built-in HTTPS API used here."
++#endif
++
+ 
+ // ====================
+ // VERSION
+ // ====================
+-#define FW_VERSION "1.0.5"
++#define FW_VERSION "1.0.6"
+ 
+ // ====================
+ // API SETTINGS
+@@ -175,7 +191,11 @@
+ // MODEM / NET
+ // ====================
+ TinyGsm modem(SerialAT);
++#if MLW_CELLULAR_BUILTIN_HTTPS
++TinyGsmClient gsmClient(modem);   // SIM7600 cellular HTTPS uses modem.https_*; this plain client is kept only for compatibility.
++#else
+ TinyGsmClientSecure gsmClient(modem);
++#endif
+ WiFiClientSecure wifiClient;
+ 
+ // ====================
+@@ -207,6 +227,9 @@
+ void updateLEDSchedule();
+ 
+ bool reconnectCellularData();
++String urlEncode(const String& value);
++String avwxPathWithToken(const String& path);
++int doCellularHttpsGetBuiltIn(const String& path, String& responseOut, const char* logTag);
+ int doCellularMetarRequest(const String& path, String& responseOut);
+ int doCellularLookupRequest(const String& path, String& responseOut);
+ 
+@@ -997,11 +1020,15 @@
+   unsigned long lastDiag = 0;
+ 
+   while (millis() - start < timeoutMs) {
+-    bool gprs = modem.isGprsConnected();
++#if MLW_CELLULAR_BUILTIN_HTTPS
++    bool dataSession = true;
++#else
++    bool dataSession = modem.isGprsConnected();
++#endif
+     String ip = modem.getLocalIP();
+     ip.trim();
+ 
+-    if (gprs && ip.length() > 0 && ip != "0.0.0.0") {
++    if (dataSession && ip.length() > 0 && ip != "0.0.0.0") {
+       cellDiagIP = ip;
+       cellularDataReady = true;
+       updateCellularDiagnostics("data ready");
+@@ -1032,11 +1059,32 @@
+   digitalWrite(BOARD_POWERON_PIN, HIGH);
+ #endif
+ 
++#ifdef MODEM_RESET_PIN
++  pinMode(MODEM_RESET_PIN, OUTPUT);
++  digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
++  delay(100);
++  digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL);
++  delay(2600);
++  digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
++#endif
++
++#ifdef MODEM_FLIGHT_PIN
++  // SIM7600 boards have a flight/airplane-mode control pin. HIGH exits airplane mode.
++  pinMode(MODEM_FLIGHT_PIN, OUTPUT);
++  digitalWrite(MODEM_FLIGHT_PIN, HIGH);
++#endif
++
++#ifdef MODEM_DTR_PIN
++  // Keep DTR low so the modem does not remain in sleep.
++  pinMode(MODEM_DTR_PIN, OUTPUT);
++  digitalWrite(MODEM_DTR_PIN, LOW);
++#endif
++
+   pinMode(BOARD_PWRKEY_PIN, OUTPUT);
+   digitalWrite(BOARD_PWRKEY_PIN, LOW);
+   delay(100);
+   digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+-  delay(1000);
++  delay(MODEM_POWERON_PULSE_WIDTH_MS);
+   digitalWrite(BOARD_PWRKEY_PIN, LOW);
+   serviceDelay(5000);
+ 
+@@ -1052,7 +1100,7 @@
+       digitalWrite(BOARD_PWRKEY_PIN, LOW);
+       delay(100);
+       digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+-      delay(1000);
++      delay(MODEM_POWERON_PULSE_WIDTH_MS);
+       digitalWrite(BOARD_PWRKEY_PIN, LOW);
+       retry = 0;
+       serviceDelay(5000);
+@@ -1066,6 +1114,26 @@
+   modemAT("AT", 2000);
+   modemAT("ATE0", 2000);
+   modemAT("AT+CMEE=2", 2000);
++
++  // Helpful on SIM7600: verify the SIM is ready before attempting network attach.
++  unsigned long simStart = millis();
++  while (millis() - simStart < 30000UL) {
++    SimStatus sim = modem.getSimStatus();
++    if (sim == SIM_READY) {
++      Serial.println("[MODEM] SIM ready");
++      break;
++    }
++    Serial.println("[MODEM] Waiting for SIM ready...");
++    serviceDelay(1000);
++  }
++
++#ifdef TINY_GSM_MODEM_HAS_NETWORK_MODE
++  modem.setNetworkMode(MODEM_NETWORK_AUTO);
++#endif
++#if MLW_CELLULAR_BUILTIN_HTTPS
++  modemAT("AT+SIMCOMATI", 10000);
++#endif
++
+   updateCellularDiagnostics("modem ready");
+ }
+ 
+@@ -1081,24 +1149,34 @@
+     forceAutomaticOperatorSelection();
+   }
+ 
+-  // Make sure the 1NCE APN is in the PDP profile before gprsConnect().
++  // Make sure the 1NCE APN is in the PDP profile before enabling data.
+   String cgdc = "AT+CGDCONT=1,\"IP\",\"" + apn + "\"";
+   modemAT(cgdc, 3000);
++#if MLW_CELLULAR_BUILTIN_HTTPS
++  modem.setNetworkAPN(apn.c_str());
++#endif
+ 
+   if (!waitForCellularNetwork(CELL_NETWORK_TIMEOUT_MS)) {
+     return false;
+   }
+ 
+   for (int attempt = 1; attempt <= 3; attempt++) {
++#if MLW_CELLULAR_BUILTIN_HTTPS
++    Serial.println("[CELL] SIM7600 network-active attempt " + String(attempt));
++    lastStatusLine = "SIM7600 data attempt " + String(attempt);
++    modem.setNetworkDeactivate();
++    serviceDelay(1500);
++    bool ok = modem.setNetworkActive(apn, false);
++#else
+     Serial.println("[CELL] GPRS connect attempt " + String(attempt));
+     lastStatusLine = "GPRS connect attempt " + String(attempt);
+-
+     modem.gprsDisconnect();
+     serviceDelay(1500);
+-
+     bool ok = modem.gprsConnect(apn.c_str(), "", "");
++#endif
++
+     if (ok) {
+-      Serial.println("[CELL] gprsConnect returned true");
++      Serial.println("[CELL] data attach returned true");
+       if (waitForCellularDataReady(CELL_DATA_TIMEOUT_MS)) {
+         Serial.println("[CELL] Settling cellular data before first HTTPS request...");
+         lastStatusLine = "Cellular data settling";
+@@ -1107,9 +1185,9 @@
+         return true;
+       }
+     } else {
+-      Serial.println("[CELL] gprsConnect returned false");
+-      cellLastError = "gprsConnect failed attempt " + String(attempt);
+-      updateCellularDiagnostics("gprsConnect failed");
++      Serial.println("[CELL] data attach returned false");
++      cellLastError = "data attach failed attempt " + String(attempt);
++      updateCellularDiagnostics("data attach failed");
+     }
+ 
+     if (attempt == 2) {
+@@ -1132,7 +1210,11 @@
+   lastStatusLine = "Reconnecting cellular data";
+   cellularDataReady = false;
+ 
++#if MLW_CELLULAR_BUILTIN_HTTPS
++  modem.setNetworkDeactivate();
++#else
+   modem.gprsDisconnect();
++#endif
+   serviceDelay(1500);
+ 
+   if (connectCellularData(false, "reconnect")) {
+@@ -1228,9 +1310,89 @@
+   lastFetchMillis = millis();
+ }
+ 
++String urlEncode(const String& value) {
++  String encoded;
++  const char *hex = "0123456789ABCDEF";
++  for (size_t i = 0; i < value.length(); i++) {
++    char c = value.charAt(i);
++    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
++      encoded += c;
++    } else {
++      encoded += '%';
++      encoded += hex[(c >> 4) & 0x0F];
++      encoded += hex[c & 0x0F];
++    }
++  }
++  return encoded;
++}
++
++String avwxPathWithToken(const String& path) {
++  String out = path;
++  out += (out.indexOf('?') >= 0) ? "&token=" : "?token=";
++  out += urlEncode(avwxApiKey);
++  return out;
++}
++
++int doCellularHttpsGetBuiltIn(const String& path, String& responseOut, const char* logTag) {
++  responseOut = "";
++
++#if !MLW_CELLULAR_BUILTIN_HTTPS
++  (void)path;
++  (void)logTag;
++  return -799;
++#else
++  if (!modem.isNetworkConnected() || !cellularDataReady) {
++    cellLastError = String(logTag) + " attempted before SIM7600 data ready";
++    return -701;
++  }
++
++  String fullUrl = String("https://") + AVWX_HOST + avwxPathWithToken(path);
++  Serial.print("["); Serial.print(logTag); Serial.print("] SIM7600 HTTPS URL: ");
++  Serial.println(fullUrl.substring(0, fullUrl.indexOf("token=") + 6) + "***");
++
++  modem.https_end();
++  serviceDelay(250);
++  modem.https_begin();
++
++  if (!modem.https_set_url(fullUrl.c_str(), TINYGSM_SSL_AUTO)) {
++    cellLastError = String(logTag) + " https_set_url failed";
++    Serial.print("["); Serial.print(logTag); Serial.println("] https_set_url failed");
++    modem.https_end();
++    return -711;
++  }
++
++  int statusCode = modem.https_get();
++  Serial.print("["); Serial.print(logTag); Serial.print("] SIM7600 HTTPS: ");
++  Serial.println(statusCode);
++
++  if (statusCode == 200) {
++    responseOut = modem.https_body();
++    Serial.print("["); Serial.print(logTag); Serial.print("] Response length: ");
++    Serial.println(responseOut.length());
++    if (responseOut.length() > 0) {
++      Serial.print("["); Serial.print(logTag); Serial.println("] First 300 chars:");
++      Serial.println(responseOut.substring(0, 300));
++    }
++  } else {
++    String header = modem.https_header();
++    if (header.length()) {
++      Serial.print("["); Serial.print(logTag); Serial.print("] HTTPS header: ");
++      Serial.println(header);
++    }
++  }
++
++  modem.https_end();
++  return statusCode;
++#endif
++}
++
+ int doCellularMetarRequest(const String& path, String& responseOut) {
+   responseOut = "";
+ 
++#if MLW_CELLULAR_BUILTIN_HTTPS
++  return doCellularHttpsGetBuiltIn(path, responseOut, "METAR");
++#else
+   if (!modem.isNetworkConnected() || !modem.isGprsConnected() || !cellularDataReady) {
+     cellLastError = "Cellular request attempted before data ready";
+     return -701;
+@@ -1265,11 +1427,15 @@
+ 
+   http.stop();
+   return statusCode;
++#endif
+ }
+ 
+ int doCellularLookupRequest(const String& path, String& responseOut) {
+   responseOut = "";
+ 
++#if MLW_CELLULAR_BUILTIN_HTTPS
++  return doCellularHttpsGetBuiltIn(path, responseOut, "LOOKUP");
++#else
+   if (!modem.isNetworkConnected() || !modem.isGprsConnected() || !cellularDataReady) {
+     cellLastError = "Lookup attempted before cellular data ready";
+     return -701;
+@@ -1297,6 +1463,7 @@
+ 
+   http.stop();
+   return statusCode;
++#endif
+ }
+ 
+ void findNearbyAirport() {
+@@ -1810,7 +1977,7 @@
+   Serial.println("FW Version: " FW_VERSION);
+   Serial.println("========================================");
+ 
+-  SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
++  SerialAT.begin(MODEM_BAUDRATE, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
+ 
+   loadConfig();
+   setupStrip();
